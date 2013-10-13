@@ -1,0 +1,6 @@
+boto
+fabric
+docopt
+requests
+git+https://github.com/gilliam/gilliam-py.git
+git+https://github.com/gilliam/client.git
