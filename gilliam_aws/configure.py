@@ -84,7 +84,9 @@ class Configure(object):
         sudo('curl https://get.docker.io/gpg | apt-key add -')
         sudo('echo "deb http://get.docker.io/ubuntu docker main" > /etc/apt/sources.list.d/docker.list')
         sudo('apt-get -qq update ')
+        sudo('apt-get -qq install -y linux-image-extra-$(uname -r)')
         sudo('apt-get install -y lxc-docker')
         # XXX: right not we're running over HTTP to support WebSocket.
         sudo('sed -i "s#docker -d#docker -d -H 0.0.0.0:3000#g" /etc/init/docker.conf')
         sudo('service docker restart')
+        sudo('modprobe aufs')

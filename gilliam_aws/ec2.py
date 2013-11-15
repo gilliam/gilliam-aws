@@ -14,6 +14,7 @@
 
 import logging
 import time
+import os
 
 from boto.ec2 import connect_to_region
 
@@ -22,9 +23,14 @@ log = logging.getLogger(__name__)
 
 
 AMI_MAPPING = {
-    'eu-west-1': 'ami-57b0a223'
+    #'ap-northeast-1': 'ami-6b01666a',
+    #'ap-southeast-1': 'ami-1cdf8a4e',
+    'eu-west-1': 'ami-2adc3c5d',
+    #'sa-east-1': 'ami-ab3791b6',
+    #'us-east-1': 'ami-69d9fc00',
+    ##'us-west-1': 'ami-40aa9c05',
+    #'us-west-2': 'ami-b8b92288',
     }
-
 
 
 def connect(region, **args):
@@ -64,11 +70,38 @@ def _create_security_groups(conn, prefix, allowed, spec):
     return groups
 
 
+def _get_or_make_keypair(conn, key_dir, key_name):
+    """Get or create a key pair with the given name."""
+    try:
+        key = conn.get_all_key_pairs(keynames=[key_name])[0]
+    except conn.ResponseError, e:
+        if e.code == 'InvalidKeyPair.NotFound':
+            log.info("creating keypair {0}".format(key_name))
+            # Create an SSH key to use when logging into instances.
+            key = conn.create_key_pair(key_name)
+
+            # Make sure the specified key_dir actually exists.
+            # If not, create it.
+            key_dir = os.path.expanduser(key_dir)
+            key_dir = os.path.expandvars(key_dir)
+            if not os.path.isdir(key_dir):
+                os.makedirs(key_dir, 0700)
+
+            # AWS will store the public key but the private key is
+            # generated and returned and needs to be stored locally.
+            # The save method will also chmod the file to protect
+            # your private key.
+            key.save(key_dir)
+        else:
+            raise
+    return key
+
+
 def _wait_for_system_and_instance_status_checks(conn, instances):
     """Wait for the given instances to pass system and instance status
     checks.
     """
-    log.info("waiting for instances to pass system and  status checks...")
+    log.info("waiting for instances to pass system and status checks...")
 
     instance_ids = [i.id for i in instances]
     while True:
@@ -97,7 +130,7 @@ def _wait_for_instances(conn, instances):
     _wait_for_system_and_instance_status_checks(conn, instances)
 
 
-def _reserve_instances(conn, config, security_groups):
+def _reserve_instances(conn, config, security_groups, key_name):
     """Create instances based on the given configuration.  This
     implementation creates a single instance that has provides every
     role.
@@ -107,7 +140,7 @@ def _reserve_instances(conn, config, security_groups):
     ami = AMI_MAPPING[config.get('aws_region')]
     image = conn.get_all_images(image_ids=[ami])[0]
     return image.run(
-        key_name=config.get('aws_ec2_key_pair'),
+        key_name=key_name,
         security_groups=security_groups.values(),
         instance_type=config.get('aws_ec2_instance_type'),
         min_count=1,
@@ -121,49 +154,11 @@ def _collect_instances(conn, name):
     instances = []
     for reservation in conn.get_all_instances():
         group_names = [g.name for g in reservation.groups]
-        if any(name.startswith(name + '-') for name in group_names):
+        if any([group_name.startswith(name + '-') for group_name in group_names]):
             instances.extend(
-                i for i in reservation.instances
-                if is_active(i))
+                i for i in reservation.instances)
+                #if is_active(i))
     return instances
-
-
-def _make_host_string(nodes, username='ubuntu'):
-    return ','.join(['%s@%s' % (username, n.public_dns_name)
-                     for n in nodes])
-
-
-def wait_for_instances(conn, instances):
-    while True:
-        for i in instances:
-            i.update()
-        if len([i for i in instances if i.state == 'pending']) > 0:
-            time.sleep(5)
-        else:
-            break
-    _wait_for_system_and_instance_status_checks(conn, instances)
-
-
-def _ensure_router_group_rules(group):
-    if not group.rules:
-        group.authorize('tcp', 22, 22, '0.0.0.0/0')
-        group.authorize('tcp', 8080, 8080, '0.0.0.0/0')
-
-
-def _ensure_exec_group_rules(group, router_group):
-    if not group.rules:
-        group.authorize(src_group=router_group)
-        group.authorize(src_group=group)
-        group.authorize('tcp', 22, 22, '0.0.0.0/0')
-        # FIXME: only expose ...
-        group.authorize('tcp', 1024, 65535, '0.0.0.0/0')
-
-
-def _ensure_sr_group_rules(group, exec_group):
-    if not group.rules:
-        group.authorize(src_group=exec_group)
-        group.authorize('tcp', 22, 22, '0.0.0.0/0')
-        group.authorize('tcp', 3222, 3222, '0.0.0.0/0')
 
 
 # Check whether a given EC2 instance object is in a state we consider active,
@@ -171,7 +166,6 @@ def _ensure_sr_group_rules(group, exec_group):
 # active since we can restart stopped clusters.
 def is_active(instance):
     return (instance.state in ['pending', 'running', 'stopping', 'stopped'])
-
 
 
 class AmazonWebServicesStage(object):
@@ -190,13 +184,16 @@ class AmazonWebServicesStage(object):
         'sr': [
             'exec', 'router',
             ('tcp', 3222, 3222)
-            ]
+            ],
         }
 
-    def __init__(self, config, name, nodes):
+
+    def __init__(self, config, name, nodes, ssh_key_file=None):
         self.config = config
         self.name = name
         self.nodes = nodes
+        self.username = 'ubuntu'
+        self.ssh_key_file = ssh_key_file
 
     @classmethod
     def get(cls, conn, config, name):
@@ -225,24 +222,22 @@ class AmazonWebServicesStage(object):
         :returns: the created `AmazonWebServicesStage` object.
         """
         log.info("creating stage {0}".format(name))
+        # FIXME: the path should not be specified here.
+        key_name = name
+        key_dir = os.path.expanduser("~/.gilliam/ec2-ssh-keys")
+        key_pair = _get_or_make_keypair(conn, key_dir, key_name)
         security_groups = _create_security_groups(
             conn, name, allowed, AmazonWebServicesStage.SECURITY_GROUPS)
-        res = _reserve_instances(conn, config, security_groups)
+        res = _reserve_instances(conn, config, security_groups, key_name)
         _wait_for_instances(conn, res.instances)
-        return cls(config, name, res.instances)
+        return cls(config, name, res.instances, ssh_key_file=os.path.join(
+                key_dir, name + '.pem'))
 
     def destroy(self, conn):
         """Destroy the cluster by terminating all instances."""
         for inst in self.nodes:
             if inst.state not in ["shutting-down", "terminated"]:
                 inst.terminate()
-
-    def _ami_for_region(self, region):
-        """."""
-        AMI_MAPPING = {
-            'eu-west-1': 'ami-57b0a223'
-            }
-        return AMI_MAPPING[region]
 
     def _roles(self, node):
         """From a EC2 instance try to decuce what roles it has.
@@ -268,4 +263,3 @@ class AmazonWebServicesStage(object):
         """Return a sequence of `(hostname, roles)` tuples."""
         for node in self.nodes:
             yield node.public_dns_name, self._roles(node)
-
